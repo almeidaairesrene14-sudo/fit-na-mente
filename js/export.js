@@ -36,4 +36,100 @@ async function ensureFFmpeg(){
 function metadata(video){
   if(video.readyState>=1 && Number.isFinite(video.duration)) return Promise.resolve();
   return new Promise((ok,bad)=>{
-    const t=setTimeout(()=>{clean();bad(new Error("O vídeo não conseguiu
+    const t=setTimeout(()=>{clean();bad(new Error("O vídeo não conseguiu carregar os metadados."));},15000);
+    const clean=()=>{clearTimeout(t);video.removeEventListener("loadedmetadata",done);video.removeEventListener("error",fail);};
+    const done=()=>{clean();ok();}, fail=()=>{clean();bad(new Error("O navegador não conseguiu abrir o vídeo."));};
+    video.addEventListener("loadedmetadata",done);video.addEventListener("error",fail);
+  });
+}
+
+function ended(video){
+  if(video.ended) return Promise.resolve();
+  return new Promise((ok,bad)=>{
+    const ms=Math.max(120000,((video.duration||60)+30)*1000);
+    const t=setTimeout(()=>{clean();bad(new Error("A reprodução demorou demais para terminar."));},ms);
+    const clean=()=>{clearTimeout(t);video.removeEventListener("ended",done);video.removeEventListener("error",fail);};
+    const done=()=>{clean();ok();}, fail=()=>{clean();bad(new Error("Erro durante a reprodução do vídeo."));};
+    video.addEventListener("ended",done);video.addEventListener("error",fail);
+  });
+}
+
+async function exportVideo(file,index){
+  const ff=await ensureFFmpeg();
+  setStatus("Abrindo vídeo "+(index+1)+"...");
+  const video=await loadVideo(file);
+  await metadata(video);
+  if(!video.duration || !Number.isFinite(video.duration)) throw new Error("Duração do vídeo inválida.");
+
+  const canvas=document.createElement("canvas"); canvas.width=1080;canvas.height=1920;
+  const ctx=canvas.getContext("2d",{alpha:false});
+  if(!ctx) throw new Error("Não foi possível criar o canvas.");
+  const stream=canvas.captureStream(30);
+
+  try{
+    const AC=window.AudioContext||window.webkitAudioContext;
+    if(AC){
+      const ac=new AC(), src=ac.createMediaElementSource(video), dst=ac.createMediaStreamDestination();
+      src.connect(dst);src.connect(ac.destination);
+      dst.stream.getAudioTracks().forEach(t=>stream.addTrack(t));
+      if(ac.state==="suspended") await ac.resume();
+    }
+  }catch(e){console.warn("Áudio não capturado:",e);}
+
+  let mime="";
+  for(const m of ["video/webm;codecs=vp9,opus","video/webm;codecs=vp8,opus","video/webm"])
+    if(MediaRecorder.isTypeSupported(m)){mime=m;break;}
+  if(!mime) throw new Error("Este navegador não suporta gravação WebM.");
+
+  const chunks=[], rec=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:8000000});
+  rec.ondataavailable=e=>{if(e.data&&e.data.size)chunks.push(e.data);};
+  const done=new Promise((ok,bad)=>{rec.onstop=()=>ok(new Blob(chunks,{type:mime}));rec.onerror=e=>bad(e.error||new Error("Erro no MediaRecorder."));});
+
+  const draw=()=>{drawFrame(ctx,canvas,video,selectedTemplate,document.getElementById("profileInput").value,logoImage);if(!video.ended)requestAnimationFrame(draw);};
+  draw();rec.start(250);
+  try{await video.play();}catch(e){if(rec.state!=="inactive")rec.stop();throw new Error("O navegador bloqueou a reprodução. Clique na página e tente novamente.");}
+  await ended(video);
+  await new Promise(r=>setTimeout(r,300));
+  if(rec.state!=="inactive")rec.stop();
+  const webm=await done;
+  if(!webm.size) throw new Error("O navegador gerou um WebM vazio.");
+  video.pause();if(video.src&&video.src.startsWith("blob:"))URL.revokeObjectURL(video.src);
+
+  setStatus("Convertendo vídeo "+(index+1)+" para MP4/H.264...");
+  const input="input_"+index+".webm", output="fitnamente_"+String(index+1).padStart(2,"0")+".mp4";
+  try{await ff.deleteFile(input);}catch(e){} try{await ff.deleteFile(output);}catch(e){}
+  await ff.writeFile(input,new Uint8Array(await webm.arrayBuffer()));
+  await ff.exec(["-i",input,"-map","0:v:0","-map","0:a:0?","-c:v","libx264","-preset","veryfast","-crf","23","-pix_fmt","yuv420p","-r","30","-c:a","aac","-b:a","128k","-ar","48000","-movflags","+faststart","-shortest",output]);
+  const data=await ff.readFile(output);
+  if(!data||!data.length) throw new Error("FFmpeg não criou o MP4. "+lastFFmpegLog);
+  try{await ff.deleteFile(input);}catch(e){} try{await ff.deleteFile(output);}catch(e){}
+  return {blob:new Blob([data.buffer],{type:"video/mp4"}),name:output};
+}
+
+async function generateAll(){
+  if(!videos||!videos.length){setStatus("Adicione pelo menos um vídeo.");return;}
+  const results=document.getElementById("results"), gen=document.getElementById("generateBtn"), dl=document.getElementById("downloadBtn");
+  results.innerHTML="";generated=[];gen.disabled=true;dl.disabled=true;
+  try{
+    setProgress(0);await ensureFFmpeg();
+    for(let i=0;i<videos.length;i++){
+      const out=await exportVideo(videos[i],i);generated.push(out);
+      const url=URL.createObjectURL(out.blob), row=document.createElement("div");row.className="result";
+      row.innerHTML=`<span>${out.name} <small>(MP4/H.264)</small></span><a href="${url}" download="${out.name}">Baixar</a>`;
+      results.appendChild(row);setProgress(((i+1)/videos.length)*100);
+    }
+    setStatus("Concluído! MP4/H.264 pronto.");dl.disabled=false;
+  }catch(e){
+    console.error("ERRO:",e);const msg=e&&e.message?e.message:String(e);
+    setStatus("Erro: "+msg);alert("A geração parou.\n\n"+msg+"\n\nÚltimo log FFmpeg:\n"+lastFFmpegLog);
+  }finally{gen.disabled=false;}
+}
+
+async function downloadZip(){
+  if(!generated||!generated.length)return;
+  if(!window.JSZip){alert("JSZip não carregou. Use Ctrl+F5.");return;}
+  const zip=new JSZip();generated.forEach(f=>zip.file(f.name,f.blob));
+  const blob=await zip.generateAsync({type:"blob",compression:"STORE"}),url=URL.createObjectURL(blob),a=document.createElement("a");
+  a.href=url;a.download="videos-fitnamente-mp4.zip";document.body.appendChild(a);a.click();a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);setStatus("ZIP pronto.");
+}
