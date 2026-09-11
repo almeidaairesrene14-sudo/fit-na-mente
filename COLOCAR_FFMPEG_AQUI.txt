@@ -1,4 +1,0 @@
-Coloque aqui os arquivos oficiais do FFmpeg WebAssembly que você decidir usar.
-Não renomeie os arquivos sem ajustar as referências no JavaScript.
-
-Observação: esta versão inicial funciona sem FFmpeg, usando MediaRecorder. A conversão para MP4/H.264 deve ser integrada em export.js para cumprir o requisito de exportação MP4.
